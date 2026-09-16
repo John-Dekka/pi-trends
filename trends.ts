@@ -6,8 +6,6 @@
  * top regions, related queries/topics, topic autocomplete, and
  * daily / realtime trending searches.
  *
- * Port of trends.py (requests-only, Chrome headers + warmup + token dance).
- *
  * Usage:
  * 1. Copy to ~/.pi/agent/extensions/trends.ts or .pi/extensions/trends.ts
  * 2. No API key, no config. Just use the tools.
@@ -82,7 +80,7 @@ interface TrendingDetails {
 }
 
 // ============
-// Session + HTTP (port of trends.py)
+// Session + HTTP
 // ============
 
 interface TrendSession {
@@ -222,7 +220,7 @@ function normProp(gprop: string | undefined): string {
 }
 
 // ============
-// Core fetchers (port of trends.py)
+// Core fetchers
 // ============
 
 async function suggestTopics(
