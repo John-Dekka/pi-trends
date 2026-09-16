@@ -1,0 +1,12 @@
+{
+  "name": "pi-trends",
+  "version": "0.1.0",
+  "description": "Google Trends extension for pi - interest over time, related queries, topic suggest, daily trending searches. No API key, no pytrends.",
+  "keywords": ["pi-package", "pi", "extension", "trends", "google-trends"],
+  "pi": {
+    "extensions": ["./trends.ts"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
