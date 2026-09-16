@@ -10,6 +10,9 @@
  * 1. Copy to ~/.pi/agent/extensions/trends.ts or .pi/extensions/trends.ts
  * 2. No API key, no config. Just use the tools.
  * 3. If Google 429s you, wait 30-60min. Don't loop - you'll extend the ban.
+ * 4. NEVER call trends_* tools in parallel in one block - batch keywords
+ *    into ONE trends call. The extension also serializes calls process-wide
+ *    (queued calls sleep up to 60s instead of hammering Google).
  */
 
 import type { ExtensionAPI, TruncationResult } from "@earendil-works/pi-coding-agent";
@@ -112,6 +115,63 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 			reject(new Error("aborted"));
 		}, { once: true });
 	});
+}
+
+// ============
+// Global throttle: ONE Google lookup at a time, process-wide.
+// Google flags concurrent sessions from one IP as scraper traffic - that is
+// exactly how a 30-60min 429 ban starts (e.g. 2x suggest + 1x trends fired
+// in one parallel block). Every tool below runs inside withGoogleSlot():
+// queued calls SLEEP here (up to 60s) instead of failing or hammering.
+// The tool descriptions still tell the model to batch + go sequential -
+// this is the safety net for when it doesn't listen.
+let trendQueue: Promise<void> = Promise.resolve();
+let lastToolEnd = 0;
+const MIN_TOOL_GAP_MS = 5000; // cooldown between tool runs
+const MAX_QUEUE_WAIT_MS = 60000; // max sleep while queued
+
+async function withGoogleSlot<T>(label: string, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+	const prev = trendQueue;
+	let releaseSlot!: () => void;
+	trendQueue = new Promise<void>((res) => { releaseSlot = res; });
+	const finish = () => { lastToolEnd = Date.now(); releaseSlot(); };
+
+	const waitStart = Date.now();
+	try {
+		// wait for our turn (previous holder), max 60s
+		while (true) {
+			const turn = await Promise.race([prev.then(() => true), sleep(1000, signal).then(() => false)]);
+			if (turn) break;
+			if (Date.now() - waitStart >= MAX_QUEUE_WAIT_MS) {
+				throw new Error(
+					`Another trends lookup is still running after 60s - dropped "${label}" instead of piling on and risking a rate-limit ban. Retry shortly.`,
+				);
+			}
+			// else: keep sleeping quietly, partial render shows the pacing state
+		}
+		// cooldown since last tool finished
+		const gap = MIN_TOOL_GAP_MS - (Date.now() - lastToolEnd);
+		if (gap > 0) await sleep(gap, signal);
+		return await fn();
+	} finally {
+		finish();
+	}
+}
+
+// ============
+// Shared session: warm up ONCE per 10min, reuse cookies after.
+// A fresh warmup is 3 requests; doing it per tool call (and worse, per
+// parallel call) is what gets the IP flagged. Cached session skips it.
+const sessionCache = new Map<string, { s: TrendSession; warmedAt: number }>();
+const WARM_TTL_MS = 10 * 60 * 1000;
+
+async function getSession(hl: string, keyword: string, geo: string, signal?: AbortSignal): Promise<TrendSession> {
+	const cached = sessionCache.get(hl);
+	if (cached && cached.s.cookies.size > 0 && Date.now() - cached.warmedAt < WARM_TTL_MS) return cached.s;
+	const s: TrendSession = { cookies: new Map(), hl };
+	await warmup(s, keyword, geo, signal);
+	sessionCache.set(hl, { s, warmedAt: Date.now() });
+	return s;
 }
 
 function stripGoogleJson(text: string): any {
@@ -229,8 +289,7 @@ async function suggestTopics(
 	tz = -120,
 	signal?: AbortSignal,
 ): Promise<{ mid: string; title: string; type: string }[]> {
-	const s: TrendSession = { cookies: new Map(), hl };
-	await warmup(s, keyword, "US", signal);
+	const s = await getSession(hl, keyword, "US", signal);
 	const res = await trendGet(
 		s,
 		`https://trends.google.com/trends/api/autocomplete/${encodeURIComponent(keyword)}`,
@@ -261,9 +320,8 @@ async function fetchTrends(
 ): Promise<RawTrends> {
 	const geoN = normGeo(geo);
 	const prop = normProp(gprop);
-	const s: TrendSession = { cookies: new Map(), hl };
 	const warmupKw = keywords.find((k) => !k.startsWith("/m/") && !k.startsWith("/g/")) ?? keywords[0];
-	await warmup(s, warmupKw, geoN || "US", signal);
+	const s = await getSession(hl, warmupKw, geoN || "US", signal);
 
 	const req = {
 		comparisonItem: keywords.map((k) => ({ keyword: k, geo: geoN, time: timeframe })),
@@ -295,9 +353,9 @@ async function fetchTrends(
 	};
 
 	await sleep(2000, signal); // explore -> widgetdata with 0 delay = flag
-	for (const w of widgets) {
+	async function fetchWidget(w: any): Promise<void> {
 		const endpoint = ENDPOINTS[w.id];
-		if (!endpoint) continue;
+		if (!endpoint) return;
 		try {
 			const r = await trendGet(
 				s,
@@ -310,6 +368,17 @@ async function fetchTrends(
 			if (w.id === "TIMESERIES") throw e; // fatal, rest aren't
 		}
 		await sleep(2000, signal); // pacing or you eat a 429
+	}
+	for (const w of widgets) {
+		// RELATED_TOPICS fetched lazily below (only if QUERIES came back empty).
+		// saves one request per call in the common case.
+		if (w.id === "RELATED_TOPICS") continue;
+		await fetchWidget(w);
+	}
+	const queriesRanked: any[] = out.widgets.RELATED_QUERIES?.default?.rankedList ?? [];
+	if (!queriesRanked.some((r) => r.rankedKeyword?.length)) {
+		const topicsWidget = widgets.find((w) => w.id === "RELATED_TOPICS");
+		if (topicsWidget) await fetchWidget(topicsWidget);
 	}
 	if (!out.widgets.TIMESERIES) {
 		if (keywords.some((k) => k.startsWith("/m/") || k.startsWith("/g/"))) {
@@ -433,8 +502,7 @@ async function fetchDailyTrends(
 	tz = -120,
 	signal?: AbortSignal,
 ): Promise<{ date: string; items: TrendingItem[] }> {
-	const s: TrendSession = { cookies: new Map(), hl };
-	await warmup(s, "Taylor Swift", geo || "US", signal);
+	const s = await getSession(hl, "Taylor Swift", geo || "US", signal);
 	const res = await trendGet(
 		s,
 		"https://trends.google.com/trends/api/dailytrends",
@@ -467,8 +535,7 @@ async function fetchRealtimeTrends(
 	category = "all",
 	signal?: AbortSignal,
 ): Promise<TrendingItem[]> {
-	const s: TrendSession = { cookies: new Map(), hl };
-	await warmup(s, "Taylor Swift", geo || "US", signal);
+	const s = await getSession(hl, "Taylor Swift", geo || "US", signal);
 	const res = await trendGet(
 		s,
 		"https://trends.google.com/trends/api/realtimetrends",
@@ -509,7 +576,7 @@ export default function trendsExtension(pi: ExtensionAPI) {
 		name: "trends",
 		label: "Google Trends",
 		description:
-			"Look up Google Trends interest for 1-5 keywords or topic ids. Returns LLM-ready summary: interest over time (sampled 0-100), top regions, related top/rising queries. Keywords are literal strings; /m/xxx or /g/xxx ids are semantic topics (resolve via trends_suggest first). Use for current and recent trend analysis, comparisons, seasonality.",
+			"Look up Google Trends interest for 1-5 keywords or topic ids. Returns LLM-ready summary: interest over time (sampled 0-100), top regions, related top/rising queries. Keywords are literal strings; /m/xxx or /g/xxx ids are semantic topics (resolve via trends_suggest first). Use for current and recent trend analysis, comparisons, seasonality. IMPORTANT - Google rate-limits hard (429 = 30-60min IP ban): NEVER call trends_* tools in parallel in one block. Batch up to 5 keywords into ONE call via keywords=[...]. If you also need suggest or trending, run them SEQUENTIALLY, never alongside this call.",
 
 		parameters: Type.Object({
 			keywords: Type.Array(Type.String(), {
@@ -546,13 +613,15 @@ export default function trendsExtension(pi: ExtensionAPI) {
 			const topN = Math.min(Math.max(Math.floor((params.topN as number | undefined) ?? 10), 1), 25);
 			const format = ((params.format as string | undefined) ?? "json").toLowerCase();
 
-			const raw = await fetchTrends(keywords, geo, timeframe, hl, -120, category, property, signal);
-			const payload = toLlmPayload(raw, maxPoints, topN);
-
-			let text: string;
-			if (format === "md") text = toMarkdown(payload);
-			else if (format === "both") text = `${JSON.stringify(payload, null, 2)}\n\n<!-- MARKDOWN -->\n\n${toMarkdown(payload)}`;
-			else text = JSON.stringify(payload, null, 2);
+			const { payload, text } = await withGoogleSlot(`trends ${keywords.join(",")}`, signal, async () => {
+				const raw = await fetchTrends(keywords, geo, timeframe, hl, -120, category, property, signal);
+				const p = toLlmPayload(raw, maxPoints, topN);
+				let t: string;
+				if (format === "md") t = toMarkdown(p);
+				else if (format === "both") t = `${JSON.stringify(p, null, 2)}\n\n<!-- MARKDOWN -->\n\n${toMarkdown(p)}`;
+				else t = JSON.stringify(p, null, 2);
+				return { payload: p, text: t };
+			});
 
 			const truncation = truncateHead(text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
 			const details: TrendsDetails = { ...payload, format };
@@ -574,7 +643,7 @@ export default function trendsExtension(pi: ExtensionAPI) {
 		},
 
 		renderResult(result, { expanded, isPartial }, theme) {
-			if (isPartial) return new Text(theme.fg("warning", "Fetching trends..."), 0, 0);
+			if (isPartial) return new Text(theme.fg("warning", "Fetching trends... (pacing, may sleep up to 60s)"), 0, 0);
 			const details = result.details as TrendsDetails | undefined;
 			if (!details) return new Text(theme.fg("dim", "No trend data"), 0, 0);
 			let text = theme.fg("success", details.labels.join(" vs "));
@@ -596,7 +665,7 @@ export default function trendsExtension(pi: ExtensionAPI) {
 		name: "trends_suggest",
 		label: "Trends Suggest",
 		description:
-			"Resolve a keyword to Google Trends semantic topic ids (/m/xxx, /g/xxx). Topics group all spellings/languages of an entity. Use before trends when you need entity-level volume instead of a literal string match.",
+			"Resolve a keyword to Google Trends semantic topic ids (/m/xxx, /g/xxx). Topics group all spellings/languages of an entity. Use before trends when you need entity-level volume instead of a literal string match. IMPORTANT: never call in parallel with trends or other suggests - run SEQUENTIALLY, or better, batch keywords into one trends call and skip this entirely. Google 429-bans the IP for 30-60min on concurrent traffic.",
 
 		parameters: Type.Object({
 			keyword: Type.String({ description: "Keyword to resolve, e.g. 'Kamillentee', 'Taylor Swift'." }),
@@ -607,7 +676,9 @@ export default function trendsExtension(pi: ExtensionAPI) {
 			const keyword = params.keyword as string;
 			const hl = (params.hl as string | undefined) ?? "en-US";
 			if (!keyword?.trim()) throw new Error("Need a keyword.");
-			const topics = await suggestTopics(keyword.trim(), hl, -120, signal);
+			const topics = await withGoogleSlot(`suggest ${keyword.trim()}`, signal, () =>
+				suggestTopics(keyword.trim(), hl, -120, signal),
+			);
 			const text = topics.length
 				? `Topics for "${keyword}":\n` + topics.map((t) => `- ${t.mid}  ${t.title}  [${t.type}]`).join("\n")
 					+ (topics[0] ? `\n\nUse: trends with keywords=["${topics[0].mid}"]` : "")
@@ -627,7 +698,7 @@ export default function trendsExtension(pi: ExtensionAPI) {
 		},
 
 		renderResult(result, { isPartial }, theme) {
-			if (isPartial) return new Text(theme.fg("warning", "Resolving topics..."), 0, 0);
+			if (isPartial) return new Text(theme.fg("warning", "Resolving topics... (pacing, may sleep up to 60s)"), 0, 0);
 			const details = result.details as SuggestDetails | undefined;
 			if (!details || !details.topics.length) return new Text(theme.fg("dim", "No topics found"), 0, 0);
 			return new Text(theme.fg("success", `${details.topics.length} topics for "${details.keyword}"`), 0, 0);
@@ -639,7 +710,7 @@ export default function trendsExtension(pi: ExtensionAPI) {
 		name: "trends_trending",
 		label: "Trending Now",
 		description:
-			"Get current trending searches for a region: what people are searching RIGHT NOW (daily trends) plus last-24h realtime stories. Use when the harness needs current/recent trends without a specific keyword. No keyword needed.",
+			"Get current trending searches for a region: what people are searching RIGHT NOW (daily trends) plus last-24h realtime stories. Use when the harness needs current/recent trends without a specific keyword. No keyword needed. IMPORTANT: never call in parallel with other trends_* tools - run SEQUENTIALLY. Google 429-bans the IP for 30-60min on concurrent traffic.",
 
 		parameters: Type.Object({
 			geo: Type.Optional(Type.String({
@@ -659,19 +730,21 @@ export default function trendsExtension(pi: ExtensionAPI) {
 			const hl = (params.hl as string | undefined) ?? "en-US";
 			if (!["daily", "realtime", "both"].includes(mode)) throw new Error("mode must be daily, realtime, or both.");
 
-			let items: TrendingItem[] = [];
-			let date = "";
-			if (mode === "daily" || mode === "both") {
-				const d = await fetchDailyTrends(geo, hl, -120, signal);
-				date = d.date;
-				items.push(...d.items);
-			}
-			if (mode === "realtime" || mode === "both") {
-				const rt = await fetchRealtimeTrends(geo, hl, -120, "all", signal);
-				// tag realtime queries so the harness can tell sources apart
-				for (const t of rt) if (!items.some((x) => x.query === t.query)) items.push(t);
-			}
-			if (mode === "both" && items.length > 50) items = items.slice(0, 50);
+			const { items, date } = await withGoogleSlot(`trending ${geo}/${mode}`, signal, async () => {
+				let found: TrendingItem[] = [];
+				let d = "";
+				if (mode === "daily" || mode === "both") {
+					const daily = await fetchDailyTrends(geo, hl, -120, signal);
+					d = daily.date;
+					found.push(...daily.items);
+				}
+				if (mode === "realtime" || mode === "both") {
+					const rt = await fetchRealtimeTrends(geo, hl, -120, "all", signal);
+					for (const t of rt) if (!found.some((x) => x.query === t.query)) found.push(t);
+				}
+				if (mode === "both" && found.length > 50) found = found.slice(0, 50);
+				return { items: found, date: d };
+			});
 
 			const text = (date ? `Trending in ${normGeo(geo) || "US"} (${date}, ${mode}):\n\n` : `Trending in ${normGeo(geo) || "US"} (${mode}):\n\n`)
 				+ formatTrending(items, limit);
@@ -694,7 +767,7 @@ export default function trendsExtension(pi: ExtensionAPI) {
 		},
 
 		renderResult(result, { expanded, isPartial }, theme) {
-			if (isPartial) return new Text(theme.fg("warning", "Fetching trending..."), 0, 0);
+			if (isPartial) return new Text(theme.fg("warning", "Fetching trending... (pacing, may sleep up to 60s)"), 0, 0);
 			const details = result.details as TrendingDetails | undefined;
 			if (!details || !details.items.length) return new Text(theme.fg("dim", "No trending searches"), 0, 0);
 			let text = theme.fg("success", `${details.items.length} trending in ${details.geo}`);
